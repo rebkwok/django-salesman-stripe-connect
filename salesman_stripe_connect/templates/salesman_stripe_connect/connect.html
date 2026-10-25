@@ -1,0 +1,28 @@
+{% extends "salesman_stripe_connect/base.html" %}
+
+{% block title %}Stripe account{% endblock %}
+
+{% block content %}
+<div class="container stripe-connect mb-5">
+    <h1>Stripe account</h1>
+    {% if account %}
+        <p>
+            Card payments are made to the Stripe account <strong>{{ account.account_id }}</strong>{% if not account.livemode %} (test mode){% endif %},
+            connected on {{ account.date_connected|date:"j F Y" }}.
+        </p>
+        {% if allow_disconnect %}
+            <p><a href="{% url 'stripe-connect-disconnect' %}">Disconnect this account</a></p>
+        {% endif %}
+    {% else %}
+        <p>
+            No Stripe account is connected, so card payments can't be taken. To
+            connect one, you'll be taken to Stripe to log in and allow this website
+            to take payments for you.
+        </p>
+        <form method="post" action="{% url 'stripe-connect-authorize' %}">
+            {% csrf_token %}
+            <button type="submit" class="btn btn-primary">Connect Stripe account</button>
+        </form>
+    {% endif %}
+</div>
+{% endblock %}

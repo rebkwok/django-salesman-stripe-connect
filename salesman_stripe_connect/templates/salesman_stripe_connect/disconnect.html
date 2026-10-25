@@ -1,0 +1,19 @@
+{% extends "salesman_stripe_connect/base.html" %}
+
+{% block title %}Disconnect Stripe account{% endblock %}
+
+{% block content %}
+<div class="container stripe-connect mb-5">
+    <h1>Disconnect Stripe account</h1>
+    <p>
+        Are you sure you want to disconnect the Stripe account
+        <strong>{{ account.account_id }}</strong>? Card payments can't be taken
+        until a Stripe account is connected again.
+    </p>
+    <form method="post">
+        {% csrf_token %}
+        <button type="submit" class="btn btn-danger">Yes, disconnect it</button>
+        <a href="{% url 'stripe-connect' %}" class="ms-3">No, go back</a>
+    </form>
+</div>
+{% endblock %}

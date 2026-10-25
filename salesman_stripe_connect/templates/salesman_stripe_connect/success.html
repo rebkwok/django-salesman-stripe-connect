@@ -1,0 +1,6 @@
+<h1>Thank you</h1>
+{% if order %}
+  <p>Your order reference is <strong>{{ order.ref }}</strong>.</p>
+{% else %}
+  <p>Your order is being processed.</p>
+{% endif %}
