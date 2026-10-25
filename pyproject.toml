@@ -31,7 +31,7 @@ build-backend = "hatchling.build"
 packages = ["salesman_stripe_connect"]
 
 [tool.hatch.build.targets.sdist]
-include = ["salesman_stripe_connect", "tests", "README.md", "LICENSE"]
+include = ["salesman_stripe_connect", "tests", "docs", "README.md", "CHANGELOG.md", "LICENSE"]
 
 [dependency-groups]
 dev = [

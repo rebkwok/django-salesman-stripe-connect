@@ -5,7 +5,9 @@ from django.core.exceptions import ImproperlyConfigured
 class AppSettings:
     """
     Settings, read from Django settings when they're used (so tests can
-    override them).
+    override them), apart from SALESMAN_STRIPE_CONNECT_PAYMENT_LABEL, which is
+    read when the payment method class is defined (salesman's label is a class
+    attribute).
     """
 
     @property

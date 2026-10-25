@@ -89,10 +89,12 @@ def _extra_rows(obj):
 class StripeConnectPayment(PaymentMethod):
     """
     Stripe Checkout payment method. Subclass it to add project-specific
-    behaviour; the methods marked as hooks are there to be overridden.
+    behaviour; the methods marked as hooks are there to be overridden (see the
+    README's Customising section).
 
     The Basket model should use mixins.StripeBasketMixin, and the Order model
-    mixins.OrderAmountsMixin.
+    mixins.OrderAmountsMixin. The project's views must stop the basket being
+    changed while a payment is in progress (see StripeBasketMixin).
     """
 
     identifier = "stripe"
@@ -517,6 +519,18 @@ class StripeConnectPayment(PaymentMethod):
         return refunded, errors
 
     @classmethod
+    def get_refund_data(cls, payment):
+        """
+        Hook: data for refunding an order payment in full (refund_order and
+        refund_payment), see https://docs.stripe.com/api/refunds/create.
+        E.g. add refund_application_fee if the platform takes a fee.
+        """
+        return {
+            "payment_intent": payment.transaction_id,
+            "metadata": {"order": payment.order.ref},
+        }
+
+    @classmethod
     def _refund(cls, payment):
         """
         Refund the payment in Stripe and record the refund.
@@ -525,8 +539,7 @@ class StripeConnectPayment(PaymentMethod):
         order = payment.order
         try:
             refund = cls.client().v1.refunds.create(
-                {"payment_intent": payment.transaction_id, "metadata": {"order": order.ref}},
-                options=cls.request_options(),
+                cls.get_refund_data(payment), options=cls.request_options()
             )
         except stripe.StripeError as e:
             logger.exception(

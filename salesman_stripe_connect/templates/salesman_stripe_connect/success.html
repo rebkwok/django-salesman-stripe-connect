@@ -1,4 +1,9 @@
-<h1>Thank you</h1>
+{% comment %}
+After the customer has paid. A minimal page: override it (or set the payment
+method's success_template_name) to use the site's layout. Context: order (if
+it has been created; otherwise the webhook will create it), email and total
+(from the Stripe session), and the payment method's get_view_context.
+{% endcomment %}<h1>Thank you</h1>
 {% if order %}
   <p>Your order reference is <strong>{{ order.ref }}</strong>.</p>
 {% else %}

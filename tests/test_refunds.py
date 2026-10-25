@@ -74,6 +74,22 @@ def test_refund_order(paid_order, requests_mock, account, refund_signals):
     ]
 
 
+def test_refund_data_hook(paid_order, requests_mock):
+    # e.g. a platform that takes a fee refunds it too
+    class FeePayment(StripeConnectPayment):
+        @classmethod
+        def get_refund_data(cls, payment):
+            return {**super().get_refund_data(payment), "refund_application_fee": True}
+
+    refund = requests_mock.post(REFUNDS_URL, json=refund_json())
+    assert FeePayment.refund_order(paid_order) == (Decimal("20.00"), [])
+    assert parse_qs(refund.last_request.text) == {
+        "payment_intent": ["pi_1"],
+        "metadata[order]": [paid_order.ref],
+        "refund_application_fee": ["true"],
+    }
+
+
 def test_refund_order_error(paid_order, requests_mock, caplog):
     requests_mock.post(
         REFUNDS_URL,

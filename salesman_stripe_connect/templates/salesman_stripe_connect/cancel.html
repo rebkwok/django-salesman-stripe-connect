@@ -1,2 +1,7 @@
-<h1>Payment cancelled</h1>
+{% comment %}
+After the customer has cancelled on Stripe's page (the basket has been
+unlocked). A minimal page: override it (or set the payment method's
+cancel_template_name) to use the site's layout. Context: the payment method's
+get_view_context.
+{% endcomment %}<h1>Payment cancelled</h1>
 <p>Your payment was cancelled.</p>

@@ -2,6 +2,10 @@
 Signals sent by StripeConnectPayment, for project-specific behaviour (e.g.
 emails). They're sent inside the transaction that records the change, so
 receivers sending emails should use transaction.on_commit.
+
+The sender is the payment method class (StripeConnectPayment, or the project's
+subclass), except for account_deauthorized when the account is disconnected
+from the disconnect page (the sender is then connect_views.disconnect_view).
 """
 from django.dispatch import Signal
 
