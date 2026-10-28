@@ -12,7 +12,7 @@ from salesman.core.utils import get_salesman_model
 
 from salesman_stripe_connect.models import ConnectedAccount
 from salesman_stripe_connect.payment import StripeConnectPayment
-from .utils import ACCOUNT
+from .utils import ACCOUNT, CUSTOMER_ID, CUSTOMERS_URL
 
 Basket = get_salesman_model("Basket")
 Order = get_salesman_model("Order")
@@ -32,6 +32,20 @@ def connected_account(request):
     account = ConnectedAccount(account_id=ACCOUNT, livemode=False)
     account.save()
     yield account
+
+
+@pytest.fixture(autouse=True)
+def stripe_customers(requests_mock):
+    """
+    Stripe's API is faked in every test (requests_mock: an unexpected request
+    fails), with the customer for test@test.com: (list, create) mocks
+    """
+    listed = requests_mock.get(
+        CUSTOMERS_URL,
+        json={"object": "list", "data": [{"id": CUSTOMER_ID, "object": "customer"}], "has_more": False},
+    )
+    created = requests_mock.post(CUSTOMERS_URL, json={"id": "cus_new", "object": "customer"})
+    yield listed, created
 
 
 @pytest.fixture

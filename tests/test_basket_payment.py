@@ -220,13 +220,37 @@ def test_success_view_context(rf, checkout_basket, requests_mock):
         StripeConnectPayment.success_view(success_request(rf))
     _, template, context = render.call_args.args
     assert template == "salesman_stripe_connect/success.html"
-    assert context == {"email": "test@test.com", "total": 20, "order": Order.objects.get()}
+    assert context == {
+        "email": "test@test.com",
+        "total": 20,
+        "order": Order.objects.get(),
+        "payment_pending": False,
+    }
 
 
 def test_success_view_unpaid(rf, checkout_basket, requests_mock):
-    requests_mock.get(SESSION_URL, json=session_json(payment_status="unpaid"))
-    resp = StripeConnectPayment.success_view(success_request(rf))
-    assert "Your order is being processed" in resp.content.decode()
+    # a payment that completes later (e.g. a bank debit): the order, on hold
+    requests_mock.get(
+        SESSION_URL,
+        json=session_json(client_reference_id=f"basket_{checkout_basket.id}", payment_status="unpaid"),
+    )
+    content = StripeConnectPayment.success_view(success_request(rf)).content.decode()
+    order = Order.objects.get()
+    assert order.status == Order.Status.HOLD
+    assert f"Your order reference is <strong>{order.ref}</strong>." in content
+    assert "Your order will be processed once your payment has been received." in content
+    assert "Your order is being processed" not in content
+
+
+def test_success_view_not_complete(rf, checkout_basket, requests_mock):
+    # (e.g. the success page's address visited before paying): no order
+    requests_mock.get(
+        SESSION_URL,
+        json=session_json(
+            client_reference_id=f"basket_{checkout_basket.id}", status="open", payment_status="unpaid"
+        ),
+    )
+    StripeConnectPayment.success_view(success_request(rf))
     assert not Order.objects.exists()
 
 

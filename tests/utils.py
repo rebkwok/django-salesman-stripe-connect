@@ -10,6 +10,8 @@ API = "https://api.stripe.com/v1"
 SESSIONS_URL = f"{API}/checkout/sessions"
 SESSION_URL = f"{SESSIONS_URL}/test-session"
 REFUNDS_URL = f"{API}/refunds"
+CUSTOMERS_URL = f"{API}/customers"
+CUSTOMER_ID = "cus_test"
 
 
 def session_json(**params):

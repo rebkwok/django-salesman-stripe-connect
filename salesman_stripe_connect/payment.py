@@ -5,7 +5,13 @@ the connected account, and the platform's webhook endpoint listens to events
 on connected accounts.
 
 Webhook events handled:
-- checkout.session.completed: the order is paid (fulfil_session)
+- checkout.session.completed: the order is paid (fulfil_session); or, for a
+  payment that completes later (e.g. a bank debit), the order is created on
+  hold, awaiting payment
+- checkout.session.async_payment_succeeded: a payment that completed later has
+  arrived: the order is paid (fulfil_session)
+- checkout.session.async_payment_failed: a payment that was to complete later
+  failed (fail_session)
 - checkout.session.expired: an unpaid checkout expired (expire_basket_payment)
 - charge.refunded: a full or partial refund, from the orders admin or the
   connected account's Stripe dashboard (handle_charge_refunded)
@@ -210,7 +216,10 @@ class StripeConnectPayment(PaymentMethod):
             "line_items": self.get_line_items(obj, request),
         }
         email = self.get_customer_email(obj)
-        if email:
+        customer = self.get_customer(email) if email else None
+        if customer:
+            data["customer"] = customer
+        elif email:
             data["customer_email"] = email
         expiry = self.get_session_expiry(obj)
         if expiry is not None:
@@ -223,6 +232,24 @@ class StripeConnectPayment(PaymentMethod):
         30 minutes and 24 hours), or None for Stripe's default of 24 hours
         """
         return None
+
+    def get_customer(self, email):
+        """
+        Hook: the connected account's Stripe customer id for the email (found,
+        or created), or None to give Checkout just the email. With a customer,
+        Checkout can offer bank transfers, and the customer's payments are
+        grouped in the Stripe dashboard. If Stripe can't be reached, None.
+        """
+        client = self.client()
+        options = self.request_options()
+        try:
+            customers = client.v1.customers.list({"email": email, "limit": 1}, options=options)
+            if customers.data:
+                return customers.data[0].id
+            return client.v1.customers.create({"email": email}, options=options).id
+        except stripe.StripeError:
+            logger.exception("Error finding or creating the Stripe customer for %s", email)
+            return None
 
     def get_customer_email(self, obj):
         email = obj.extra.get("email") if isinstance(obj, BaseBasket) else obj.email
@@ -307,14 +334,29 @@ class StripeConnectPayment(PaymentMethod):
     # Completed payments
 
     @classmethod
+    def session_paid(cls, session):
+        """
+        Whether the checkout session has been paid: "unpaid" for a payment that
+        completes later (e.g. a bank debit), when the session has completed
+        """
+        return session.payment_status in ("paid", "no_payment_required")
+
+    @classmethod
     def fulfil_session(cls, request, session):
         """
-        Create and pay the order for a completed checkout session.
+        Create the order for a completed checkout session, and pay it.
+
+        If the payment completes later (e.g. a bank debit: the session's
+        payment_status is "unpaid"), the order is created with the pending
+        status (SALESMAN_STRIPE_CONNECT_PENDING_STATUS), and paid when this is
+        called again once the money has arrived (the
+        checkout.session.async_payment_succeeded event), when it's given the
+        paid status.
 
         Called from the webhook, the success view and check_basket_payment, so
         it's safe to call more than once, including concurrently: the order
         records the session id, and whichever call comes first creates the
-        order and payment; later calls return the existing order.
+        order (and payment); later calls return the existing order.
 
         A payment for an empty basket (e.g. its items expired) or a payment that
         doesn't match the order total is recorded on the order and flagged, so
@@ -331,6 +373,7 @@ class StripeConnectPayment(PaymentMethod):
                 session.client_reference_id,
             )
             return None, NOT_SHOP_PAYMENT
+        paid = cls.session_paid(session)
 
         with transaction.atomic():
             # Lock the basket or order so that concurrent calls for the same
@@ -343,12 +386,34 @@ class StripeConnectPayment(PaymentMethod):
             existing_order = Order.objects.filter(
                 _extra__stripe_session_id=session.id
             ).first()
-            if existing_order is None:
+            if existing_order is None and session.payment_intent:
                 existing_order = cls.get_order_for_payment(session.payment_intent)
             if existing_order is not None:
+                existing_order = Order.objects.select_for_update().get(pk=existing_order.pk)
+                if paid and not cls.order_paid_by(existing_order, session):
+                    # A payment that completed later has arrived
+                    cls._pay(existing_order, session)
+                    if existing_order.status != app_settings.SALESMAN_STRIPE_CONNECT_PENDING_STATUS:
+                        # e.g. the order was cancelled while waiting
+                        cls.flag_order(
+                            existing_order,
+                            f"Payment {session.payment_intent} was received, but the "
+                            f"order's status is {existing_order.status_display}. "
+                            "Check it, and refund if necessary.",
+                        )
+                        return existing_order, "Order paid, but flagged"
+                    existing_order.status = cls.paid_status(existing_order)
+                    existing_order.save()
+                    logger.info("Order paid: %s", existing_order.ref)
+                    return existing_order, "Order paid"
                 logger.info("Stripe session %s already fulfilled", session.id)
                 return existing_order, "Order already fulfilled"
 
+            status = (
+                app_settings.SALESMAN_STRIPE_CONNECT_PAID_STATUS
+                if paid
+                else app_settings.SALESMAN_STRIPE_CONNECT_PENDING_STATUS
+            )
             if kind == "basket":
                 if basket is None:
                     logger.error(
@@ -361,11 +426,7 @@ class StripeConnectPayment(PaymentMethod):
                 # basket.extra is copied to order.extra
                 basket.extra.pop(basket.STRIPE_SESSION_KEY, None)
                 basket.extra["stripe_session_id"] = session.id
-                order = Order.objects.create_from_basket(
-                    basket,
-                    request,
-                    status=app_settings.SALESMAN_STRIPE_CONNECT_PAID_STATUS,
-                )
+                order = Order.objects.create_from_basket(basket, request, status=status)
                 basket.delete()
                 if basket_was_empty:
                     cls.flag_order(
@@ -383,24 +444,158 @@ class StripeConnectPayment(PaymentMethod):
                     )
                     return None, "Missing order"
                 order.extra["stripe_session_id"] = session.id
+                if not paid:
+                    order.status = status
                 order.save()
 
-            amount = from_minor_units(session.amount_total)
-            if amount != order.total:
-                cls.flag_order(
-                    order,
-                    f"Payment {session.payment_intent} of {cls.format_amount(amount)} "
-                    "doesn't match the order total of "
-                    f"{cls.format_amount(order.total)}.",
-                )
-            order.pay(
-                amount=amount,
-                transaction_id=session.payment_intent,
-                payment_method=cls.identifier,
-            )
+            if not paid:
+                logger.info("Order awaiting payment: %s", order.ref)
+                return order, "Order awaiting payment"
+            cls._pay(order, session)
 
         logger.info("Order fulfilled: %s", order.ref)
         return order, "Order fulfilled"
+
+    @classmethod
+    def paid_status(cls, order):
+        """
+        Hook: the status of an order (on hold) once its payment has arrived:
+        SALESMAN_STRIPE_CONNECT_PAID_STATUS
+        """
+        return app_settings.SALESMAN_STRIPE_CONNECT_PAID_STATUS
+
+    @classmethod
+    def order_paid_by(cls, order, session):
+        """Whether the session's payment has been recorded on the order"""
+        return order.payments.filter(
+            transaction_id=session.payment_intent, amount__gt=0
+        ).exists()
+
+    @classmethod
+    def _pay(cls, order, session):
+        """Record the session's payment on the order (flagged if it doesn't match)"""
+        amount = from_minor_units(session.amount_total)
+        if amount != order.total:
+            cls.flag_order(
+                order,
+                f"Payment {session.payment_intent} of {cls.format_amount(amount)} "
+                "doesn't match the order total of "
+                f"{cls.format_amount(order.total)}.",
+            )
+        order.pay(
+            amount=amount,
+            transaction_id=session.payment_intent,
+            payment_method=cls.identifier,
+        )
+
+    @classmethod
+    def fail_session(cls, session):
+        """
+        A payment that was to complete later (e.g. a bank debit) has failed: the
+        order (created on hold when the checkout completed) is given the failed
+        status (SALESMAN_STRIPE_CONNECT_FAILED_STATUS), noted, and passed to
+        order_payment_failed (e.g. to put its items back in stock).
+        Returns (order or None, message).
+        """
+        with transaction.atomic():
+            order = (
+                Order.objects.select_for_update()
+                .filter(_extra__stripe_session_id=session.id)
+                .first()
+            )
+            if order is None:
+                logger.info("Stripe session %s failed, with no order", session.id)
+                return None, "Event ignored"
+            if (
+                order.status != app_settings.SALESMAN_STRIPE_CONNECT_PENDING_STATUS
+                or cls.order_paid_by(order, session)
+            ):
+                # Already failed, paid, or changed (e.g. cancelled) meanwhile
+                return order, "Event already processed"
+            cls._fail_order(
+                order, f"Payment {session.payment_intent} failed: the order hasn't been paid."
+            )
+        logger.warning("Order %s: payment %s failed", order.ref, session.payment_intent)
+        return order, "Payment failed"
+
+    @classmethod
+    def _fail_order(cls, order, note):
+        """Give the (locked) order the failed status, note why, and call the hook"""
+        order.status = app_settings.SALESMAN_STRIPE_CONNECT_FAILED_STATUS
+        order.save()
+        cls.add_note_once(order, note)
+        cls.order_payment_failed(order)
+
+    @classmethod
+    def expire_pending_orders(cls, older_than):
+        """
+        Fail orders still awaiting a payment that completes later after
+        older_than (a timedelta), e.g. bank transfers the customer never made:
+        Stripe doesn't fail those itself. Run regularly (e.g. from cron).
+
+        Each order's payment is checked with Stripe first: if it's been paid,
+        the order is paid; if it's still being collected (e.g. a bank debit,
+        which can't be cancelled), it's left for Stripe; if part of it has
+        arrived, the order is flagged (once) for someone to check. Otherwise the
+        payment is cancelled in Stripe, and the order failed, as for a failed
+        payment (order_payment_failed). Stripe errors are logged, and the order
+        left for next time.
+
+        Returns [(order, message)].
+        """
+        cutoff = timezone.now() - older_than
+        orders = Order.objects.filter(
+            status=app_settings.SALESMAN_STRIPE_CONNECT_PENDING_STATUS,
+            date_created__lt=cutoff,
+            _extra__has_key="stripe_session_id",
+        )
+        return [(order, cls._expire_pending_order(order, older_than)) for order in orders]
+
+    @classmethod
+    def _expire_pending_order(cls, order, older_than):
+        client, options = cls.client(), cls.request_options()
+        try:
+            session = cls.retrieve_session(order.extra["stripe_session_id"])
+            if cls.session_paid(session):
+                cls.fulfil_session(None, session)
+                return "Paid"
+            payment_intent = client.v1.payment_intents.retrieve(
+                session.payment_intent, options=options
+            )
+            if payment_intent.status == "processing":
+                return "Still processing"
+            if payment_intent.amount_received:
+                received = cls.format_amount(from_minor_units(payment_intent.amount_received))
+                if cls.add_note_once(
+                    order,
+                    f"Only {received} of payment {payment_intent.id} has been received "
+                    "so far. Check it with the customer.",
+                ):
+                    logger.error("Order %s: payment %s partly received", order.ref, payment_intent.id)
+                return "Partly paid"
+            with transaction.atomic():
+                order = Order.objects.select_for_update().get(pk=order.pk)
+                if order.status != app_settings.SALESMAN_STRIPE_CONNECT_PENDING_STATUS:
+                    return "Changed meanwhile"
+                client.v1.payment_intents.cancel(payment_intent.id, options=options)
+                cls._fail_order(
+                    order,
+                    f"Payment {payment_intent.id} wasn't received within "
+                    f"{older_than.days} days, so it has been cancelled.",
+                )
+        except stripe.StripeError:
+            logger.exception("Error checking order %s's pending payment", order.ref)
+            return "Error"
+        logger.warning("Order %s: payment not received in time, cancelled", order.ref)
+        return "Cancelled"
+
+    @classmethod
+    def order_payment_failed(cls, order):
+        """
+        Hook: the order's payment failed after its checkout completed (and the
+        order has been given the failed status); e.g. put its items back in
+        stock, and tell the customer
+        """
 
     @classmethod
     def get_order_for_payment(cls, payment_intent):
@@ -475,9 +670,9 @@ class StripeConnectPayment(PaymentMethod):
         """
         Check the status of the basket's checkout session (e.g. when the
         customer returns to their basket) rather than waiting for a webhook.
-        Fulfils the order if the session has been paid, or unlocks the basket if
-        it has expired.
-        Returns the order if the session has been paid, otherwise None.
+        Fulfils the order if the session has completed (paid, or awaiting a
+        payment that completes later), or unlocks the basket if it has expired.
+        Returns the order if the session has completed, otherwise None.
         """
         try:
             session = cls.retrieve_session(basket.stripe_session_id)
@@ -486,7 +681,7 @@ class StripeConnectPayment(PaymentMethod):
                 "Error retrieving Stripe session %s", basket.stripe_session_id
             )
             return None
-        if session.status == "complete" and session.payment_status == "paid":
+        if session.status == "complete":
             order, _ = cls.fulfil_session(request, session)
             return order
         if session.status == "expired":
@@ -790,8 +985,13 @@ class StripeConnectPayment(PaymentMethod):
             return "Event ignored"
         obj = event.data.object
         match event.type:
-            case "checkout.session.completed":
+            case (
+                "checkout.session.completed"
+                | "checkout.session.async_payment_succeeded"
+            ):
                 _, message = cls.fulfil_session(request, obj)
+            case "checkout.session.async_payment_failed":
+                _, message = cls.fail_session(obj)
             case "checkout.session.expired":
                 _, message = cls.expire_basket_payment(obj)
             case "charge.refunded":
@@ -846,10 +1046,11 @@ class StripeConnectPayment(PaymentMethod):
     @classmethod
     def success_view(cls, request):
         """
-        The customer has paid. Fulfil the order here as well as in the webhook,
-        so the customer sees their order (and an empty basket) without waiting
-        for the webhook. If anything goes wrong, the webhook will still fulfil
-        the order.
+        The customer has paid (or, for a payment that completes later, e.g. a
+        bank debit, has finished checking out: payment_pending in the context).
+        Fulfil the order here as well as in the webhook, so the customer sees
+        their order (and an empty basket) without waiting for the webhook. If
+        anything goes wrong, the webhook will still fulfil the order.
         """
         context = cls.get_view_context(request)
         session_id = request.GET.get("session_id")
@@ -863,7 +1064,8 @@ class StripeConnectPayment(PaymentMethod):
         if session is not None:
             context["email"] = session.customer_details.email
             context["total"] = from_minor_units(session.amount_total)
-            if session.payment_status == "paid":
+            context["payment_pending"] = not cls.session_paid(session)
+            if session.status == "complete":
                 try:
                     context["order"], _ = cls.fulfil_session(request, session)
                 except Exception:

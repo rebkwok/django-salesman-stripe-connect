@@ -19,7 +19,8 @@ their Stripe keys.
 
 - A salesman payment method, `StripeConnectPayment`, that sends the customer to
   Stripe Checkout, and creates the order when they've paid.
-- A webhook for Stripe's events: completed and expired checkouts, refunds
+- A webhook for Stripe's events: completed and expired checkouts, payments
+  that complete later (e.g. bank debits) succeeding or failing, refunds
   (full or partial, from the site or the Stripe dashboard), failed refunds,
   disputes, and the connected account disconnecting.
 - Pages for connecting (and disconnecting) the Stripe account, with Stripe
@@ -43,6 +44,9 @@ their Stripe keys.
 3. If the customer cancels on Stripe's page, the cancel view expires the
    session and unlocks the basket. If the session expires (after 24 hours, or
    `get_session_expiry`), the `checkout.session.expired` webhook unlocks it.
+4. For a payment method that completes later (e.g. a bank debit), the order is
+   created when the checkout completes, awaiting payment, and paid (or failed)
+   when Stripe says so: see "Payment methods, and payments that complete later".
 
 Problems that need someone to look at them (a payment that doesn't match the
 order total, a payment for an empty basket, a failed refund, a dispute) are
@@ -160,6 +164,8 @@ mode):
   accounts** (not "Your account"), at `https://<your domain>/stripe/webhook/`,
   with API version `2026-09-30.endive`, for these events:
   - `checkout.session.completed`
+  - `checkout.session.async_payment_succeeded`
+  - `checkout.session.async_payment_failed`
   - `checkout.session.expired`
   - `charge.refunded`
   - `charge.refund.updated`
@@ -216,6 +222,8 @@ Once the account is connected, you can turn the connect pages off with
 | `SALESMAN_STRIPE_CONNECT_CURRENCY` | `"gbp"` | The currency of payments; only currencies with 2 decimal places (e.g. gbp, eur, usd) |
 | `SALESMAN_STRIPE_CONNECT_PAYMENT_LABEL` | `"Pay with Stripe"` | The payment method's label (salesman's `label`; read when the app is loaded) |
 | `SALESMAN_STRIPE_CONNECT_PAID_STATUS` | `"PROCESSING"` | The status of orders created when they're paid (one of your order statuses) |
+| `SALESMAN_STRIPE_CONNECT_PENDING_STATUS` | `"HOLD"` | The status of orders whose payment completes later (e.g. a bank debit), until it does |
+| `SALESMAN_STRIPE_CONNECT_FAILED_STATUS` | `"FAILED"` | The status of orders whose payment failed after the checkout completed |
 
 Your order statuses (`SALESMAN_ORDER_STATUS`) also need a `REFUNDED` status
 (salesman's default statuses have it), which fully refunded orders are set to.
@@ -223,29 +231,42 @@ Your order statuses (`SALESMAN_ORDER_STATUS`) also need a `REFUNDED` status
 The required settings are checked when they're used, so they need a value (a
 dummy one will do) in tests and development too.
 
-## Payment methods (cards only)
+## Payment methods, and payments that complete later
 
-The checkout session doesn't set `payment_method_types`, so Stripe Checkout
-offers the payment methods turned on in the **connected account's** Stripe
-dashboard. Some of those (e.g. bank debits) take days to complete: their
-sessions complete as unpaid, and send `checkout.session.async_payment_succeeded`
-or `..._failed` later, which this app doesn't handle, so their orders would
-never be created.
+The checkout session doesn't set `payment_method_types` (Stripe's API no longer
+accepts it for Checkout), so Checkout offers the payment methods turned on in
+the **connected account's** Stripe dashboard (Settings → Payment methods). To
+offer only some (e.g. cards, Apple Pay and Google Pay), turn the others off
+there.
 
-To offer only cards, set `payment_method_types` in `get_session_data` (Apple Pay
-and Google Pay are card payments in Checkout, so they're still offered, on
-devices that support them):
+Some methods (e.g. bank debits, bank transfers) take days to complete. Their
+sessions complete as unpaid: the order is created then, with
+`SALESMAN_STRIPE_CONNECT_PENDING_STATUS` (`HOLD`) and no payment, and the basket
+is deleted (so the order holds its items). When the money arrives,
+`checkout.session.async_payment_succeeded` pays the order and gives it
+`SALESMAN_STRIPE_CONNECT_PAID_STATUS`; if the payment fails,
+`checkout.session.async_payment_failed` gives it
+`SALESMAN_STRIPE_CONNECT_FAILED_STATUS` (`FAILED`), notes it, and calls the
+`order_payment_failed` hook (e.g. to put its items back in stock, and tell the
+customer). Don't send an order with the pending status until it's paid. The
+success template has `payment_pending` for these.
 
-```python
-from salesman_stripe_connect.payment import StripeConnectPayment
+Stripe never fails a **bank transfer** the customer doesn't make: its order
+would wait forever. Call `StripeConnectPayment.expire_pending_orders(older_than)`
+regularly (e.g. a management command run by cron) to fail orders still awaiting
+payment after `older_than` (a `timedelta`, e.g. 7 days). It checks each payment
+with Stripe first: paid orders are paid, payments still being collected (bank
+debits) are left, and part-paid ones are flagged; the rest are cancelled in
+Stripe and failed (`order_payment_failed`). Bank transfers also can't be
+changed once the customer has their bank details (Stripe shows them, and they
+can't come back to pay another way), so you may prefer to leave them turned off.
 
-
-class PayByStripe(StripeConnectPayment):
-    def get_session_data(self, obj, request):
-        data = super().get_session_data(obj, request)
-        data["payment_method_types"] = ["card"]
-        return data
-```
+Checkout sessions are given a Stripe **customer** (found by the customer's
+email, or created, on the connected account): Checkout only offers bank
+transfers to customers, and the customer's payments are grouped in the Stripe
+dashboard. If Stripe can't find or create the customer, the session has just
+the email. Override `get_customer(email)` to change this (return `None` for no
+customer).
 
 ## Platform fees
 
@@ -315,10 +336,13 @@ Subclass `StripeConnectPayment`, put your subclass in
 |---|---|
 | `get_session_data(obj, request)` | The data for creating the Checkout session (e.g. payment methods, metadata) |
 | `get_refund_data(payment)` (classmethod) | The data for refunding an order payment from the site (e.g. `refund_application_fee`, metadata) |
+| `get_customer(email)` | The connected account's Stripe customer id for the email (found or created), or `None` for just the email |
 | `get_session_expiry(obj)` | How long until the session expires: a `timedelta` (30 minutes to 24 hours), or `None` for Stripe's default (24 hours) |
 | `session_created(obj, session, request)` | The session has been created; records it on the basket (locking it) |
 | `basket_payment_expired(basket)` (classmethod) | The basket's session has expired; called before the basket is unlocked and saved (e.g. to release stock) |
 | `basket_payment_cancelled(basket)` (classmethod) | The basket's payment has been cancelled, and the basket unlocked |
+| `paid_status(order)` (classmethod) | The status of an order on hold once its payment arrives (default `SALESMAN_STRIPE_CONNECT_PAID_STATUS`; e.g. completed, if there's nothing to send) |
+| `order_payment_failed(order)` (classmethod) | A payment that was to complete later failed, and the order has the failed status (e.g. to put its items back in stock, and tell the customer) |
 | `get_request_basket(request)` (classmethod) | The request's basket for the success and cancel views, or `None` (doesn't create one) |
 | `get_view_context(request)` (classmethod) | Extra context for the success and cancel templates |
 | `success_template_name`, `cancel_template_name` | The success and cancel templates |

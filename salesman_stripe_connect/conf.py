@@ -56,6 +56,20 @@ class AppSettings:
         """Status of orders created when a checkout session is paid"""
         return getattr(settings, "SALESMAN_STRIPE_CONNECT_PAID_STATUS", "PROCESSING")
 
+    @property
+    def SALESMAN_STRIPE_CONNECT_PENDING_STATUS(self):
+        """
+        Status of orders whose payment completes later (e.g. a bank debit): the
+        order is created when the checkout completes, and paid (given the paid
+        status) when the money arrives
+        """
+        return getattr(settings, "SALESMAN_STRIPE_CONNECT_PENDING_STATUS", "HOLD")
+
+    @property
+    def SALESMAN_STRIPE_CONNECT_FAILED_STATUS(self):
+        """Status of orders whose payment failed after the checkout completed"""
+        return getattr(settings, "SALESMAN_STRIPE_CONNECT_FAILED_STATUS", "FAILED")
+
     def _required(self, name):
         value = getattr(settings, name, None)
         if not value:

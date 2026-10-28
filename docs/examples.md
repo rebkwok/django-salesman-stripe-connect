@@ -5,7 +5,8 @@ project's shop app is called `shop`, with salesman's models in `shop/models.py`
 (see the README's Setup).
 
 - [A payment method subclass](#a-payment-method-subclass)
-- [Cards only](#cards-only)
+- [Checkout session options](#checkout-session-options)
+- [When a payment that completes later fails](#when-a-payment-that-completes-later-fails)
 - [Stopping the basket being changed during a payment](#stopping-the-basket-being-changed-during-a-payment)
 - [Checkout](#checkout)
 - [Emails from the signals](#emails-from-the-signals)
@@ -60,32 +61,52 @@ The success and cancel views and the webhook use the payment method in
 `SALESMAN_PAYMENT_METHODS`, so they use the subclass's hooks. In your own views,
 call the subclass's methods (e.g. `PayByStripe.check_basket_payment(...)`).
 
-## Cards only
+## Checkout session options
 
-By default, Stripe Checkout offers the payment methods turned on in the
-connected account's Stripe dashboard. Methods that take days to complete (e.g.
-bank debits) aren't supported, as their orders would never be created (see the
-README), so to be safe, offer only cards. Apple Pay and Google Pay are card
-payments in Checkout, so they're still offered on devices that support them.
+`get_session_data` returns the parameters for
+[creating the Checkout session](https://docs.stripe.com/api/checkout/sessions/create),
+so you can add to them, e.g. metadata:
 
 ```python
 class PayByStripe(StripeConnectPayment):
     def get_session_data(self, obj, request):
         data = super().get_session_data(obj, request)
-        data["payment_method_types"] = ["card"]
+        data["metadata"] = {"site": "shop"}
         return data
 ```
 
-`get_session_data` returns the parameters for
-[creating the Checkout session](https://docs.stripe.com/api/checkout/sessions/create),
-so the same approach works for other options, e.g. metadata:
+(Don't change `client_reference_id`, `success_url` or `cancel_url`: the app uses
+them to find the basket or order, and to return the customer to the site.
+Payment methods can't be chosen here: they're turned on and off in the
+connected account's Stripe dashboard.)
+
+## When a payment that completes later fails
+
+For payment methods that take days (e.g. bank debits), the order is created on
+hold when the checkout completes, holding its items. If the payment then
+fails, put them back, and tell the customer:
 
 ```python
-        data["metadata"] = {"site": "shop"}
-```
+from django.core.mail import send_mail
+from django.db import transaction
 
-(Don't change `client_reference_id`, `success_url` or `cancel_url`: the app uses
-them to find the basket or order, and to return the customer to the site.)
+
+class PayByStripe(StripeConnectPayment):
+    @classmethod
+    def order_payment_failed(cls, order):
+        for item in order.items.all():
+            if item.product is not None:
+                item.product.stock += item.quantity
+                item.product.save()
+        transaction.on_commit(
+            lambda: send_mail(
+                f"Payment for order {order.ref} failed",
+                "Your payment didn't go through, so your order has been cancelled.",
+                None,
+                [order.email],
+            )
+        )
+```
 
 ## Stopping the basket being changed during a payment
 

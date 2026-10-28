@@ -72,7 +72,7 @@ def test_session_data(payment, checkout_basket, request_):
         "?session_id={CHECKOUT_SESSION_ID}",
         "cancel_url": "http://testserver/api/payment/stripe/cancel/",
         "client_reference_id": f"basket_{checkout_basket.id}",
-        "customer_email": "test@test.com",
+        "customer": "cus_test",
         "line_items": [
             {
                 "price_data": {
@@ -279,3 +279,42 @@ def test_client():
     client = get_client("sk_test_1")
     assert client is get_client("sk_test_1")
     assert client is not get_client("sk_test_2")
+
+
+# The Stripe customer (so Checkout can offer bank transfers)
+
+
+def test_customer_found(payment, checkout_basket, request_, stripe_customers, account):
+    listed, created = stripe_customers
+    data = payment.get_session_data(checkout_basket, request_)
+    assert data["customer"] == "cus_test"
+    assert "customer_email" not in data
+    # looked up by email, on the connected account
+    assert listed.last_request.qs == {"email": ["test@test.com"], "limit": ["1"]}
+    assert listed.last_request.headers["Stripe-Account"] == account
+    assert not created.called
+
+
+def test_customer_created(payment, checkout_basket, request_, stripe_customers, requests_mock, account):
+    listed, created = stripe_customers
+    requests_mock.get(listed._url, json={"object": "list", "data": [], "has_more": False})
+    assert payment.get_session_data(checkout_basket, request_)["customer"] == "cus_new"
+    assert created.last_request.text == "email=test%40test.com"
+    assert created.last_request.headers["Stripe-Account"] == account
+
+
+def test_customer_error(payment, checkout_basket, request_, stripe_customers, requests_mock, caplog):
+    # just the email, if Stripe can't find or create the customer
+    listed, _ = stripe_customers
+    requests_mock.get(listed._url, status_code=500, json={"error": {"message": "Error"}})
+    data = payment.get_session_data(checkout_basket, request_)
+    assert data["customer_email"] == "test@test.com"
+    assert "customer" not in data
+    assert "Error finding or creating the Stripe customer for test@test.com" in caplog.text
+
+
+def test_no_customer_without_email(payment, checkout_basket, request_, stripe_customers):
+    checkout_basket.extra.pop("email")
+    data = payment.get_session_data(checkout_basket, request_)
+    assert "customer" not in data and "customer_email" not in data
+    assert not stripe_customers[0].called
