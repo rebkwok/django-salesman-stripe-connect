@@ -2,6 +2,7 @@
 Basket payments that expire, are cancelled, or are checked when the customer
 returns; and the success and cancel views
 """
+import logging
 from unittest.mock import Mock, patch
 
 import pytest
@@ -264,6 +265,19 @@ def test_success_view_no_session(rf, requests_mock, url, caplog):
     resp = StripeConnectPayment.success_view(rf.get(url))
     assert resp.status_code == 200
     assert "Your order is being processed" in resp.content.decode()
+    # an unknown session (the id is from the address): a warning, not an error
+    assert not [r for r in caplog.records if r.levelno >= logging.ERROR]
+    if "unknown" in url:
+        assert "Unknown Stripe session unknown" in [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
+
+
+def test_success_view_stripe_error(rf, requests_mock, caplog):
+    # (other errors, e.g. Stripe's down, are errors)
+    requests_mock.get(SESSION_URL, status_code=500, json={"error": {"message": "Error"}})
+    StripeConnectPayment.success_view(rf.get("/?session_id=test-session"))
+    assert "Error retrieving Stripe session test-session" in [
+        r.getMessage() for r in caplog.records if r.levelno == logging.ERROR
+    ]
 
 
 def test_success_view_fulfil_error(rf, checkout_basket, requests_mock, caplog):

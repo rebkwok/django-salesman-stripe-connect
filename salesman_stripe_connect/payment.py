@@ -955,11 +955,13 @@ class StripeConnectPayment(PaymentMethod):
                 request.headers.get("Stripe-Signature"),
                 app_settings.SALESMAN_STRIPE_CONNECT_WEBHOOK_SECRET,
             )
+        # (warnings, not errors: anyone can post to the webhook's address; and
+        # if the signing secret is wrong, Stripe reports the failing events)
         except ValueError:
-            logger.exception("Invalid Stripe webhook payload")
+            logger.warning("Invalid Stripe webhook payload")
             return HttpResponseBadRequest("Invalid payload")
         except stripe.SignatureVerificationError:
-            logger.exception("Invalid Stripe webhook signature")
+            logger.warning("Invalid Stripe webhook signature")
             return HttpResponseBadRequest("Invalid signature")
         return HttpResponse(cls.handle_webhook_event(request, event))
 
@@ -1058,6 +1060,10 @@ class StripeConnectPayment(PaymentMethod):
         if session_id:
             try:
                 session = cls.retrieve_session(session_id)
+            except stripe.InvalidRequestError:
+                # e.g. an unknown session (the id is from the address): a
+                # warning, as anyone can visit it
+                logger.warning("Unknown Stripe session %s", session_id)
             except stripe.StripeError:
                 logger.exception("Error retrieving Stripe session %s", session_id)
 

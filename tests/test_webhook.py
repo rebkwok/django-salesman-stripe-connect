@@ -42,12 +42,19 @@ def test_webhook_url():
         (stripe.SignatureVerificationError("bad", "sig"), "Invalid signature"),
     ],
 )
-def test_webhook_invalid(client, error, message):
+def test_webhook_invalid(client, error, message, caplog):
     with patch("salesman_stripe_connect.payment.stripe.Webhook") as mock_webhook:
         mock_webhook.construct_event.side_effect = error
         resp = client.post(reverse("stripe-connect-webhook"), data={})
     assert resp.status_code == 400
     assert resp.content.decode() == message
+    # a warning, not an error: anyone can post to the webhook
+    logged_message = {
+        "Invalid payload": "Invalid Stripe webhook payload",
+        "Invalid signature": "Invalid Stripe webhook signature",
+    }[message]
+    package_records = [r for r in caplog.records if r.name.startswith("salesman_stripe_connect")]
+    assert [(r.levelno, r.getMessage()) for r in package_records] == [(logging.WARNING, logged_message)]
 
 
 def test_webhook_signature_checked(client, settings):
